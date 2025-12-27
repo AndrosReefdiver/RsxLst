@@ -1,0 +1,1380 @@
+// rsxlst.cpp - RSX-11M Files-11 ODS-1 File System Reader
+// Complete implementation with INDEXF.SYS parsing, file headers, and directory reading
+
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <cstring>
+#include <cstdint>
+#include <iomanip>
+#include <map>
+#include <algorithm>
+
+const int BLOCK_SIZE = 512;
+const int HOME_BLOCK_LBN = 1;
+
+// RAD50 character set
+const char rad50chars[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ$.%0123456789";
+
+#pragma pack(push, 1)
+
+// ===== HOME BLOCK STRUCTURE =====
+struct RSX11M_HomeBlock {
+    uint16_t hm_ibsz;          // 0-1: Index file bitmap size (blocks)
+    uint16_t hm_iblb_high;     // 2-3: Index bitmap LBN (high word)
+    uint16_t hm_iblb_low;      // 4-5: Index bitmap LBN (low word)
+    uint16_t hm_fmax;          // 6-7: Maximum number of files
+    uint16_t hm_sbcl;          // 8-9: Storage bitmap cluster factor
+    uint16_t hm_dvty;          // 10-11: Device type code
+    uint16_t hm_vlev;          // 12-13: Volume structure level (401 octal)
+    char hm_vnam[12];          // 14-25: Volume name
+    uint8_t hm_unused1[4];     // 26-29: Not used
+    uint16_t hm_vown;          // 30-31: Volume owner UIC
+    uint16_t hm_vpro;          // 32-33: Volume protection code
+    uint16_t hm_vcha;          // 34-35: Volume characteristics
+    uint16_t hm_fpro;          // 36-37: Default file protection
+    uint8_t hm_unused2[6];     // 38-43: Not used
+    uint8_t hm_wisz;           // 44: Default window size
+    uint8_t hm_fiex;           // 45: Default file extend
+    uint8_t hm_lruc;           // 46: Directory LRU limit
+    uint8_t hm_unused3[11];    // 47-57: Not used
+    uint16_t hm_chk1;          // 58-59: First checksum
+    char hm_vdat[14];          // 60-73: Volume creation date
+    uint8_t hm_unused4[398];   // 74-471: Reserved
+    char hm_indn[12];          // 472-483: Volume name copy
+    char hm_indo[12];          // 484-495: Volume owner
+    char hm_indf[12];          // 496-507: Format type
+    uint8_t hm_unused5[2];     // 508-509: Not used
+    uint16_t hm_chk2;          // 510-511: Second checksum
+};
+
+// ===== FILE HEADER STRUCTURE =====
+struct FileHeader {
+    // Header Area (28 bytes)
+    uint8_t h_idof;            // 0: Ident area offset
+    uint8_t h_mpof;            // 1: Map area offset (in words)
+    uint16_t h_fnum;           // 2-3: File number
+    uint16_t h_fseq;           // 4-5: File sequence number
+    uint16_t h_flev;           // 6-7: File structure level (should be 401 octal = 0x101 = 257 decimal)
+    uint16_t h_fown;           // 8-9: File owner UIC
+    uint16_t h_fpro;           // 10-11: File protection
+    uint8_t h_ucha;            // 12: User characteristics
+    uint8_t h_scha;            // 13: System characteristics
+    uint8_t h_ufat[32];        // 14-45: User file attribute area
+    uint8_t data[BLOCK_SIZE - 46]; // Rest of header (ident + map areas start at h_idof*2)
+};
+
+// ===== DIRECTORY ENTRY (16 bytes) =====
+struct DirEntry {
+    uint16_t file_id[3];       // 0-5: File ID (num, seq, rvn)
+    uint16_t fname[3];         // 6-11: Filename (RAD-50)
+    uint16_t ftype;            // 12-13: File type (RAD-50)
+    uint16_t version;          // 14-15: Version number
+};
+
+#pragma pack(pop)
+
+// ===== HELPER FUNCTIONS =====
+
+// Read a block from disk image
+bool readBlock(std::ifstream& img, uint32_t lbn, uint8_t* buffer) {
+    img.seekg(static_cast<std::streamoff>(lbn) * BLOCK_SIZE, std::ios::beg);
+    if (!img) return false;
+    img.read(reinterpret_cast<char*>(buffer), BLOCK_SIZE);
+    return img.gcount() == BLOCK_SIZE;
+}
+
+// Write a block to disk image
+bool writeBlock(std::ofstream& img, uint32_t lbn, const uint8_t* buffer) {
+    img.seekp(static_cast<std::streamoff>(lbn) * BLOCK_SIZE, std::ios::beg);
+    if (!img) return false;
+    img.write(reinterpret_cast<const char*>(buffer), BLOCK_SIZE);
+    return img.good();
+}
+
+// Decode one RAD50 word (3 characters)
+std::string decodeRad50Word(uint16_t word) {
+    if (word == 0) return "   ";
+    std::string result;
+    result += rad50chars[word / 1600];
+    result += rad50chars[(word / 40) % 40];
+    result += rad50chars[word % 40];
+    return result;
+}
+
+// Decode RAD50 string
+std::string decodeRad50(const uint16_t* words, int count) {
+    std::string result;
+    for (int i = 0; i < count; i++) {
+        result += decodeRad50Word(words[i]);
+    }
+    // Trim trailing spaces
+    size_t end = result.find_last_not_of(' ');
+    if (end != std::string::npos)
+        result = result.substr(0, end + 1);
+    return result;
+}
+
+// Encode one RAD50 word from 3 characters
+uint16_t encodeRad50Word(const std::string& str, int offset) {
+    uint16_t result = 0;
+    for (int i = 0; i < 3; i++) {
+        char c = (offset + i < str.length()) ? toupper(str[offset + i]) : ' ';
+        int val = 0;
+        
+        // Find character in RAD50 table
+        for (int j = 0; j < 40; j++) {
+            if (rad50chars[j] == c) {
+                val = j;
+                break;
+            }
+        }
+        result = result * 40 + val;
+    }
+    return result;
+}
+
+// Encode RAD50 string
+void encodeRad50(const std::string& str, uint16_t* words, int count) {
+    for (int i = 0; i < count; i++) {
+        words[i] = encodeRad50Word(str, i * 3);
+    }
+}
+
+// Get word from buffer (little-endian)
+uint16_t getWord(const uint8_t* buf, int offset) {
+    return buf[offset] | (buf[offset + 1] << 8);
+}
+
+// Set word in buffer (little-endian)
+void setWord(uint8_t* buf, int offset, uint16_t value) {
+    buf[offset] = value & 0xFF;
+    buf[offset + 1] = (value >> 8) & 0xFF;
+}
+
+// ===== FILE SYSTEM CLASS =====
+
+class Files11FileSystem {
+private:
+    std::string imagePath;
+    RSX11M_HomeBlock homeBlock;
+    uint32_t indexBitmapLBN;
+    std::map<uint16_t, uint32_t> fileHeaderCache; // file_num -> LBN
+    
+public:
+    Files11FileSystem(const std::string& path) : imagePath(path), indexBitmapLBN(0) {}
+    
+    bool initialize() {
+        std::ifstream img(imagePath, std::ios::binary);
+        if (!img) {
+            std::cerr << "Error: Cannot open disk image: " << imagePath << std::endl;
+            return false;
+        }
+        
+        // Read home block
+        uint8_t buffer[BLOCK_SIZE];
+        if (!readBlock(img, HOME_BLOCK_LBN, buffer)) {
+            std::cerr << "Error: Cannot read home block" << std::endl;
+            return false;
+        }
+        
+        memcpy(&homeBlock, buffer, sizeof(homeBlock));
+        indexBitmapLBN = ((uint32_t)homeBlock.hm_iblb_high << 16) | homeBlock.hm_iblb_low;
+        
+        // Clean volume name - handle non-printable characters
+        std::string volname;
+        for (int i = 0; i < 12; i++) {
+            char c = homeBlock.hm_vnam[i];
+            if (c == 0) break; // Stop at null terminator
+            if (c >= 32 && c <= 126) {
+                volname += c;
+            } else {
+                volname += ' '; // Replace non-printable with space
+            }
+        }
+        // Trim trailing spaces
+        size_t end = volname.find_last_not_of(' ');
+        if (end != std::string::npos) {
+            volname = volname.substr(0, end + 1);
+        }
+        
+        std::cout << "Files-11 Volume: " << volname << std::endl;
+        std::cout << "Structure Level: " << homeBlock.hm_vlev;
+        if (homeBlock.hm_vlev == 257 || homeBlock.hm_vlev == 0401) {
+            std::cout << " (ODS-1)" << std::endl;
+        } else {
+            std::cout << " (Unknown)" << std::endl;
+        }
+        
+        return true;
+    }
+    
+    void setDebugMode(bool enable) {
+        debugMode = enable;
+    }
+
+private:
+    bool debugMode = false;
+    
+public:
+    // Read file header for a given file number
+    bool readFileHeader(uint16_t fileNum, FileHeader& header) {
+        std::ifstream img(imagePath, std::ios::binary);
+        if (!img) return false;
+        
+        // File headers start after index bitmap
+        // Index bitmap is at indexBitmapLBN and is homeBlock.hm_ibsz blocks long
+        // File header for file N is at: indexBitmapLBN + homeBlock.hm_ibsz + (N - 1)
+        uint32_t headerLBN = indexBitmapLBN + homeBlock.hm_ibsz + fileNum - 1;
+        
+        if (debugMode && fileNum == 4) {
+            std::cout << "Debug: Reading MFD header (file #4)" << std::endl;
+            std::cout << "Debug: Index bitmap LBN: " << indexBitmapLBN << std::endl;
+            std::cout << "Debug: Index bitmap size: " << homeBlock.hm_ibsz << " blocks" << std::endl;
+            std::cout << "Debug: MFD header LBN: " << headerLBN << std::endl;
+        }
+        
+        uint8_t buffer[BLOCK_SIZE];
+        if (!readBlock(img, headerLBN, buffer)) {
+            return false;
+        }
+        
+        if (debugMode && fileNum == 4) {
+            std::cout << "Debug: MFD header block (first 128 bytes):" << std::endl;
+            for (int i = 0; i < 128; i++) {
+                if (i % 16 == 0) std::cout << std::hex << std::setfill('0') << std::setw(4) << i << ": ";
+                std::cout << std::setfill('0') << std::setw(2) << std::hex << (int)buffer[i] << " ";
+                if ((i + 1) % 16 == 0) std::cout << std::endl;
+            }
+            std::cout << std::dec << std::endl;
+        }
+        
+        memcpy(&header, buffer, sizeof(FileHeader));
+        
+        // Verify it's a valid header
+        if (header.h_fnum != fileNum) {
+            if (debugMode && fileNum == 4) {
+                std::cout << "Debug: Header file number mismatch! Expected " << fileNum 
+                          << ", got " << header.h_fnum << std::endl;
+            }
+            return false;
+        }
+        
+        if (debugMode && fileNum == 4) {
+            std::cout << "Debug: MFD h_idof=" << (int)header.h_idof << " h_mpof=" << (int)header.h_mpof << std::endl;
+            std::cout << "Debug: MFD h_fnum=" << header.h_fnum << " h_fseq=" << header.h_fseq << std::endl;
+        }
+        
+        fileHeaderCache[fileNum] = headerLBN;
+        return true;
+    }
+    
+    // Get retrieval pointers from file header
+    std::vector<std::pair<uint32_t, uint32_t>> getRetrievalPointers(const FileHeader& header, bool verbose = false) {
+        std::vector<std::pair<uint32_t, uint32_t>> pointers;
+        
+        // Map area starts at offset h_mpof (in words from start of header)
+        int mapOffset = header.h_mpof * 2; // Convert words to bytes
+        
+        // Only show debug output if both debugMode is true AND verbose is true
+        bool showDebug = debugMode && verbose;
+        
+        if (showDebug) {
+            std::cout << "Debug: getRetrievalPointers for file #" << header.h_fnum << std::endl;
+            std::cout << "Debug: h_mpof=" << (int)header.h_mpof << " words = " << mapOffset << " bytes" << std::endl;
+        }
+        
+        if (mapOffset >= BLOCK_SIZE || mapOffset < 28) {
+            if (showDebug) std::cerr << "Debug: Invalid map offset: " << mapOffset << std::endl;
+            return pointers;
+        }
+        
+        const uint8_t* mapArea = reinterpret_cast<const uint8_t*>(&header) + mapOffset;
+        int mapSize = BLOCK_SIZE - mapOffset;
+        
+        if (mapSize < 10) {
+            if (showDebug) std::cerr << "Debug: Map area too small: " << mapSize << std::endl;
+            return pointers;
+        }
+        
+        // Always dump map area for file #4 or when verbose
+        if (showDebug) {
+            std::cout << "Debug: Map area starts at byte offset " << mapOffset << std::endl;
+            std::cout << "Debug: Map area hex dump (ALL " << mapSize << " bytes):" << std::endl;
+            for (int i = 0; i < mapSize; i++) {
+                if (i % 16 == 0) std::cout << "  " << std::hex << std::setfill('0') << std::setw(3) << i << ": ";
+                std::cout << std::setfill('0') << std::setw(2) << std::hex << (int)mapArea[i] << " ";
+                if ((i + 1) % 16 == 0 || i == mapSize - 1) std::cout << std::endl;
+            }
+            std::cout << std::dec;
+        }
+        
+        // Map area structure (Section 3.4.3 of Files-11 spec):
+        uint8_t ctsz = mapArea[6]; // Count field size in bytes
+        uint8_t lbsz = mapArea[7]; // LBN field size in bytes
+        uint8_t use = mapArea[8];  // Map words in use
+        
+        if (showDebug) {
+            std::cout << "Debug: File #" << header.h_fnum << " map area at offset " << mapOffset << std::endl;
+            std::cout << "Debug: M.ESQN/M.ERVN [0-1]: " << std::hex << std::setfill('0')
+                      << std::setw(2) << (int)mapArea[0] << " " << std::setw(2) << (int)mapArea[1] << std::dec << std::endl;
+            std::cout << "Debug: M.EFNU [2-3]: " << (mapArea[2] | (mapArea[3] << 8)) << std::endl;
+            std::cout << "Debug: M.EFSQ [4-5]: " << (mapArea[4] | (mapArea[5] << 8)) << std::endl;
+            std::cout << "Debug: M.CTSZ [6]=" << (int)ctsz << " M.LBSZ [7]=" << (int)lbsz << " M.USE [8]=" << (int)use << std::endl;
+        }
+        
+        // Validate format
+        int ptrSize = ctsz + lbsz; // Total pointer size in bytes
+        if (ptrSize == 0 || ptrSize > 6 || ctsz == 0 || lbsz == 0) {
+            if (showDebug) {
+                std::cerr << "Debug: Invalid pointer format - CTSZ=" << (int)ctsz << " LBSZ=" << (int)lbsz << std::endl;
+            }
+            return pointers;
+        }
+        
+        // Start reading pointers after control data (10 bytes)
+        int offset = 10;
+        
+        if (showDebug) {
+            std::cout << "Debug: Retrieval pointers start at map offset " << offset << " (absolute byte " << (mapOffset + offset) << ")" << std::endl;
+        }
+        
+        // Read retrieval pointers
+        while (offset + ptrSize <= mapSize) {
+            // Format 1: Count (1 byte) + High LBN (1 byte) + Low LBN (2 bytes)
+            if (ctsz == 1 && lbsz == 3) {
+                // NOTE: This RSX-11M disk uses a NON-STANDARD pointer format!
+                // The count and LBN high byte are swapped compared to DEC spec.
+                // Standard: [count][lbn_hi][lbn_mid][lbn_lo]
+                // This disk: [lbn_hi][count][lbn_mid][lbn_lo]
+                
+                uint8_t byte0 = mapArea[offset];     // LBN[23:16] or padding
+                uint8_t byte1 = mapArea[offset + 1]; // COUNT (the actual count!)
+                uint8_t byte2 = mapArea[offset + 2]; // LBN[15:8]
+                uint8_t byte3 = mapArea[offset + 3]; // LBN[7:0]
+                
+                if (showDebug) {
+                    std::cout << "Debug: Raw pointer bytes at map offset " << offset << ": "
+                              << std::hex << std::setfill('0') 
+                              << std::setw(2) << (int)byte0 << " "
+                              << std::setw(2) << (int)byte1 << " "
+                              << std::setw(2) << (int)byte2 << " "
+                              << std::setw(2) << (int)byte3 << std::dec << std::endl;
+                }
+                
+                // Check for end marker - all zeros
+                if (byte0 == 0 && byte1 == 0 && byte2 == 0 && byte3 == 0) {
+                    if (showDebug) {
+                        std::cout << "Debug: End marker found (all zeros)" << std::endl;
+                    }
+                    break;
+                }
+                
+                // Use the non-standard format: byte1 is count, [byte0,byte3,byte2] form LBN
+                uint32_t count = byte1 + 1;
+                uint32_t lbn = ((uint32_t)byte0 << 16) | ((uint32_t)byte3 << 8) | (uint32_t)byte2;
+                
+                if (showDebug) {
+                    std::cout << "Debug: Decoded (non-standard format) - LBN=" << lbn << " (0x" << std::hex << lbn << std::dec 
+                              << ") Count=" << count << " (stored as " << (int)byte1 << ")" << std::endl;
+                }
+                
+                pointers.push_back(std::make_pair(lbn, count));
+                offset += 4;
+            }
+            else {
+                // Generic parsing for other formats
+                uint32_t count = 0;
+                for (int i = 0; i < ctsz; i++) {
+                    count |= (mapArea[offset + i] << (i * 8));
+                }
+                
+                uint32_t lbn = 0;
+                for (int i = 0; i < lbsz; i++) {
+                    lbn |= (mapArea[offset + ctsz + i] << (i * 8));
+                }
+                
+                if (count == 0 || lbn == 0) break;
+                
+                pointers.push_back(std::make_pair(lbn, count));
+                offset += ptrSize;
+            }
+        }
+        
+        if (showDebug) {
+            std::cout << "Debug: Found " << pointers.size() << " retrieval pointers for file #" << header.h_fnum << std::endl;
+        }
+        
+        return pointers;
+    }
+    
+    // Get all retrieval pointers including extension headers
+    std::vector<std::pair<uint32_t, uint32_t>> getAllRetrievalPointers(uint16_t fileNum, bool verbose = false) {
+        std::vector<std::pair<uint32_t, uint32_t>> allPointers;
+        
+        FileHeader header;
+        if (!readFileHeader(fileNum, header)) {
+            return allPointers;
+        }
+        
+        // Get pointers from primary header
+        auto pointers = getRetrievalPointers(header, verbose);
+        allPointers.insert(allPointers.end(), pointers.begin(), pointers.end());
+        
+        if (verbose) {
+            std::cout << "Debug: Primary header has " << pointers.size() << " pointers" << std::endl;
+        }
+        
+        // Follow extension chain using the map area extension linkage
+        // The extension info is in the map area, NOT in the fixed header!
+        int mapOffset = header.h_mpof * 2;
+        if (mapOffset >= BLOCK_SIZE || mapOffset < 46) {
+            return allPointers;
+        }
+        
+        const uint8_t* headerBytes = reinterpret_cast<const uint8_t*>(&header);
+        const uint8_t* mapArea = headerBytes + mapOffset;
+        
+        // Map area extension linkage (Section 3.4.3 of Files-11 spec):
+        // Byte 0: M.ESQN - Extension segment number
+        // Byte 1: M.ERVN - Extension relative volume number
+        // Bytes 2-3: M.EFNU - Extension file number (THIS is what we need!)
+        // Bytes 4-5: M.EFSQ - Extension file sequence number
+        
+        uint16_t extFileNum = mapArea[2] | (mapArea[3] << 8);
+        uint16_t extFileSeq = mapArea[4] | (mapArea[5] << 8);
+        
+        if (verbose) {
+            std::cout << "Debug: Map area extension file number: " << extFileNum << std::endl;
+            std::cout << "Debug: Map area extension sequence: " << extFileSeq << std::endl;
+        }
+        
+        int maxExtensions = 100; // Safety limit to prevent infinite loops
+        int extensionCount = 0;
+        
+        while (extFileNum != 0 && extensionCount < maxExtensions) {
+            if (verbose) {
+                std::cout << "Debug: Following extension header, file #" << extFileNum << std::endl;
+            }
+            
+            FileHeader extHeader;
+            if (!readFileHeader(extFileNum, extHeader)) {
+                if (verbose) {
+                    std::cerr << "Debug: Failed to read extension header #" << extFileNum << std::endl;
+                }
+                break;
+            }
+            
+            // Verify this is the correct extension by checking sequence number
+            if (extHeader.h_fseq != extFileSeq && extFileSeq != 0) {
+                if (verbose) {
+                    std::cerr << "Debug: Extension sequence mismatch: expected " << extFileSeq 
+                              << ", got " << extHeader.h_fseq << std::endl;
+                }
+            }
+            
+            // Get pointers from extension header
+            auto extPointers = getRetrievalPointers(extHeader, verbose);
+            allPointers.insert(allPointers.end(), extPointers.begin(), extPointers.end());
+            
+            if (verbose) {
+                std::cout << "Debug: Extension header has " << extPointers.size() << " pointers" << std::endl;
+            }
+            
+            // Get next extension from this extension's map area
+            int extMapOffset = extHeader.h_mpof * 2;
+            if (extMapOffset >= BLOCK_SIZE || extMapOffset < 46) {
+                break;
+            }
+            
+            const uint8_t* extHeaderBytes = reinterpret_cast<const uint8_t*>(&extHeader);
+            const uint8_t* extMapArea = extHeaderBytes + extMapOffset;
+            
+            extFileNum = extMapArea[2] | (extMapArea[3] << 8);
+            extFileSeq = extMapArea[4] | (extMapArea[5] << 8);
+            
+            extensionCount++;
+        }
+        
+        if (extensionCount >= maxExtensions) {
+            std::cerr << "Warning: Maximum extension chain length exceeded for file #" << fileNum << std::endl;
+        }
+        
+        if (verbose) {
+            std::cout << "Debug: Total extensions followed: " << extensionCount << std::endl;
+            std::cout << "Debug: Total pointers accumulated: " << allPointers.size() << std::endl;
+        }
+        
+        return allPointers;
+    }
+    
+    // Calculate total file size in blocks
+    uint32_t getFileSize(uint16_t fileNum) {
+        FileHeader header;
+        if (!readFileHeader(fileNum, header)) {
+            return 0;
+        }
+        
+        // First, try to get size from UFAT area
+        // The UFAT area at bytes 6-7 often contains the allocated file size in blocks
+        // This is more reliable than retrieval pointers which may have encoding issues
+        uint16_t ufatSize = header.h_ufat[6] | (header.h_ufat[7] << 8);
+        
+        // Validate UFAT size is reasonable (should be > 0 and < disk size)
+        if (ufatSize > 0 && ufatSize < 10000) {
+            // Check if retrieval pointers give a different answer
+            auto pointers = getAllRetrievalPointers(fileNum, false);
+            uint32_t ptrBlocks = 0;
+            for (const auto& ptr : pointers) {
+                ptrBlocks += ptr.second;
+            }
+            
+            // If pointer-based size is significantly smaller and has suspicious LBN, use UFAT
+            if (!pointers.empty() && pointers[0].first > 20000) {
+                // LBN is beyond reasonable disk size, definitely use UFAT
+                return ufatSize;
+            }
+            
+            // If pointer says 1-3 blocks but UFAT says more, trust UFAT
+            if (ptrBlocks < 10 && ufatSize > ptrBlocks * 2) {
+                return ufatSize;
+            }
+            
+            // Otherwise use pointer-based if it's larger
+            if (ptrBlocks > ufatSize) {
+                return ptrBlocks;
+            }
+            
+            return ufatSize;
+        }
+        
+        // Fallback to pointer-based calculation
+        auto pointers = getAllRetrievalPointers(fileNum, false);
+        uint32_t totalBlocks = 0;
+        for (const auto& ptr : pointers) {
+            totalBlocks += ptr.second;
+        }
+        return totalBlocks;
+    }
+    
+    // Read file data
+    std::vector<uint8_t> readFile(uint16_t fileNum) {
+        std::vector<uint8_t> data;
+        
+        FileHeader header;
+        if (!readFileHeader(fileNum, header)) {
+            std::cerr << "Error: Cannot read file header" << std::endl;
+            return data;
+        }
+        
+        // Get file size from UFAT (more reliable)
+        uint32_t fileSizeBlocks = getFileSize(fileNum);
+        
+        if (fileSizeBlocks == 0) {
+            std::cerr << "Error: File size is 0 blocks" << std::endl;
+            return data;
+        }
+        
+        // Try to get retrieval pointers
+        auto pointers = getAllRetrievalPointers(fileNum, false);
+        
+        // If pointers look suspicious (LBN too high), we can't read the file yet
+        // This is a limitation - we know the SIZE from UFAT but not the LOCATION
+        if (!pointers.empty() && pointers[0].first > 20000) {
+            std::cerr << "Error: Cannot read file data - retrieval pointer decoding issue" << std::endl;
+            std::cerr << "       (LBN " << pointers[0].first << " is beyond disk bounds)" << std::endl;
+            std::cerr << "       File size from UFAT: " << fileSizeBlocks << " blocks" << std::endl;
+            return data;
+        }
+        
+        if (pointers.empty()) {
+            std::cerr << "Error: No retrieval pointers found for file #" << fileNum << std::endl;
+            return data;
+        }
+        
+        std::ifstream img(imagePath, std::ios::binary);
+        if (!img) {
+            std::cerr << "Error: Cannot open disk image" << std::endl;
+            return data;
+        }
+        
+        // Read all blocks according to retrieval pointers
+        for (const auto& ptr : pointers) {
+            uint32_t startLBN = ptr.first;
+            uint32_t blockCount = ptr.second;
+            
+            // Sanity check
+            if (startLBN > 20000) {
+                std::cerr << "Warning: Skipping suspicious LBN " << startLBN << std::endl;
+                continue;
+            }
+            
+            for (uint32_t i = 0; i < blockCount; i++) {
+                uint8_t buffer[BLOCK_SIZE];
+                if (readBlock(img, startLBN + i, buffer)) {
+                    data.insert(data.end(), buffer, buffer + BLOCK_SIZE);
+                } else {
+                    std::cerr << "Warning: Failed to read block at LBN " << (startLBN + i) << std::endl;
+                }
+            }
+        }
+        
+        return data;
+    }
+    
+    // List directory entries
+    bool listDirectory(int group, int member, bool verbose = false) {
+        // Find MFD (Master File Directory) - always file #4
+        FileHeader mfdHeader;
+        if (!readFileHeader(4, mfdHeader)) {
+            std::cerr << "Error: Cannot read MFD header" << std::endl;
+            return false;
+        }
+        
+        if (verbose) {
+            std::cout << "Debug: Reading MFD (file #4)..." << std::endl;
+        }
+        
+        // Read MFD data
+        auto mfdData = readFile(4);
+        if (mfdData.empty()) {
+            std::cerr << "Error: Cannot read MFD data" << std::endl;
+            return false;
+        }
+        
+        // Look for UFD entry in MFD
+        // UFD filename format: "nnnmmm.DIR" where nnn=group (octal), mmm=member (octal)
+        char ufdName[16];
+        snprintf(ufdName, sizeof(ufdName), "%03o%03o", group, member);
+        std::string ufdNameStr = ufdName;
+        
+        uint16_t ufdFileNum = 0;
+        
+        if (verbose) {
+            std::cout << "Debug: Looking for UFD: " << ufdNameStr << ".DIR" << std::endl;
+        }
+        
+        // Parse MFD directory entries
+        for (size_t i = 0; i + sizeof(DirEntry) <= mfdData.size(); i += sizeof(DirEntry)) {
+            DirEntry* entry = reinterpret_cast<DirEntry*>(&mfdData[i]);
+            
+            // Check if file number is valid (non-zero)
+            if (entry->file_id[0] == 0) continue;
+            
+            std::string fname = decodeRad50(entry->fname, 3);
+            std::string ftype = decodeRad50(&entry->ftype, 1);
+            
+            // Check if this is the UFD we're looking for
+            if (fname == ufdNameStr && ftype == "DIR") {
+                ufdFileNum = entry->file_id[0];
+                if (verbose) {
+                    std::cout << "Debug: Found UFD at file #" << ufdFileNum << std::endl;
+                }
+                break;
+            }
+        }
+        
+        if (ufdFileNum == 0) {
+            std::cerr << "Error: Directory [" << std::oct << std::setfill('0') 
+                      << std::setw(3) << group << "," << std::setw(3) << member 
+                      << "] not found" << std::dec << std::endl;
+            return false;
+        }
+        
+        // Read UFD
+        auto ufdData = readFile(ufdFileNum);
+        if (ufdData.empty()) {
+            std::cerr << "Error: Cannot read UFD data" << std::endl;
+            return false;
+        }
+        
+        // Display directory listing
+        std::cout << "\n=== Directory [" << std::oct << std::setfill('0') 
+                  << std::setw(3) << group << "," << std::setw(3) << member 
+                  << "] ===" << std::dec << std::endl;
+        std::cout << std::string(80, '=') << std::endl;
+        
+        // IMPORTANT: Reset fill character to space before printing headers and data
+        std::cout << std::setfill(' ');
+
+        // Print header with proper spacing
+        std::cout << std::left 
+                  << std::setw(15) << "Filename" 
+                  << std::setw(8) << "Type" 
+                  << std::setw(8) << "Version"
+                  << std::setw(8) << "File#"
+                  << std::setw(10) << "Blocks"
+                  << std::setw(12) << "Size"
+                  << std::setw(15) << "Owner" << std::endl;
+        std::cout << std::string(80, '-') << std::endl;
+        
+        int fileCount = 0;
+        uint32_t totalBlocks = 0;
+        for (size_t i = 0; i + sizeof(DirEntry) <= ufdData.size(); i += sizeof(DirEntry)) {
+            DirEntry* entry = reinterpret_cast<DirEntry*>(&ufdData[i]);
+            
+            // Check if file number is valid (non-zero)
+            if (entry->file_id[0] == 0) continue;
+            
+            std::string fname = decodeRad50(entry->fname, 3);
+            std::string ftype = decodeRad50(&entry->ftype, 1);
+            
+            // Skip empty entries
+            if (fname.empty() || fname == "      " ) continue;
+            
+            // Get file header to read owner UIC and file size
+            FileHeader fileHdr;
+            std::string ownerUIC = "N/A";
+            uint32_t fileBlocks = 0;
+            uint32_t fileBytes = 0;
+            
+            if (readFileHeader(entry->file_id[0], fileHdr)) {
+                // UIC format: LOW byte = member (prog), HIGH byte = group (proj)
+                // According to spec section 3.4.1.6:
+                // H.PROG = H.FOWN + 0  (byte 0 = member)
+                // H.PROJ = H.FOWN + 1  (byte 1 = group)
+                int fgrp = (fileHdr.h_fown >> 8) & 0xFF;  // High byte = group
+                int fmem = fileHdr.h_fown & 0xFF;          // Low byte = member
+                
+                if (verbose) {
+                    std::cout << "Debug: File #" << entry->file_id[0] << " h_fown=" << std::hex << "0x" << fileHdr.h_fown << std::dec
+                              << " grp=" << fgrp << " mem=" << fmem << std::endl;
+                }
+                
+                char uicBuf[16];
+                snprintf(uicBuf, sizeof(uicBuf), "[%03o,%03o]", fgrp, fmem);
+                ownerUIC = uicBuf;
+                
+                // Get file size using the improved getFileSize() which checks UFAT
+                fileBlocks = getFileSize(entry->file_id[0]);
+                fileBytes = fileBlocks * BLOCK_SIZE;
+                totalBlocks += fileBlocks;
+                
+                if (verbose) {
+                    std::cout << "File #" << entry->file_id[0] << ": " << fileBlocks << " blocks from getFileSize()" << std::endl;
+                }
+            }
+            
+            // Format file size nicely
+            std::string sizeStr;
+            if (fileBytes < 1024) {
+                sizeStr = std::to_string(fileBytes) + "B";
+            } else if (fileBytes < 1024 * 1024) {
+                sizeStr = std::to_string(fileBytes / 1024) + "K";
+            } else {
+                sizeStr = std::to_string(fileBytes / (1024 * 1024)) + "M";
+            }
+            
+            // Print with proper setw and left alignment
+            std::cout << std::left << std::setfill(' ')
+                      << std::setw(15) << fname
+                      << std::setw(8) << ftype
+                      << std::setw(8) << entry->version
+                      << std::setw(8) << entry->file_id[0]
+                      << std::setw(10) << fileBlocks
+                      << std::setw(12) << sizeStr
+                      << std::setw(15) << ownerUIC << std::endl;
+            
+            fileCount++;
+        }
+        
+        std::cout << std::string(80, '-') << std::endl;
+        std::cout << "Total files: " << fileCount 
+                  << "  Total blocks: " << totalBlocks 
+                  << "  Total size: " << (totalBlocks * BLOCK_SIZE) << " bytes";
+        if (totalBlocks * BLOCK_SIZE >= 1024) {
+            std::cout << " (" << (totalBlocks * BLOCK_SIZE / 1024) << "K)";
+        }
+        std::cout << std::endl;
+        std::cout << std::string(80, '=') << std::endl;
+        
+        return true;
+    }
+    
+    // Copy file from Files-11 to local Windows filesystem
+    bool copyFromFiles11(int group, int member, const std::string& filename, 
+                         const std::string& type, int version, const std::string& outputPath) {
+        // Find file in directory
+        FileHeader mfdHeader;
+        if (!readFileHeader(4, mfdHeader)) {
+            std::cerr << "Error: Cannot read MFD" << std::endl;
+            return false;
+        }
+        
+        auto mfdData = readFile(4);
+        if (mfdData.empty()) {
+            std::cerr << "Error: Cannot read MFD" << std::endl;
+            return false;
+        }
+        
+        // Find UFD
+        char ufdName[16];
+        snprintf(ufdName, sizeof(ufdName), "%03o%03o", group, member);
+        std::string ufdNameStr = ufdName;
+        
+        uint16_t ufdFileNum = 0;
+        for (size_t i = 0; i + sizeof(DirEntry) <= mfdData.size(); i += sizeof(DirEntry)) {
+            DirEntry* entry = reinterpret_cast<DirEntry*>(&mfdData[i]);
+            if (entry->file_id[0] == 0) continue;
+            
+            std::string fname = decodeRad50(entry->fname, 3);
+            std::string ftype = decodeRad50(&entry->ftype, 1);
+            
+            if (fname == ufdNameStr && ftype == "DIR") {
+                ufdFileNum = entry->file_id[0];
+                break;
+            }
+        }
+        
+        if (ufdFileNum == 0) {
+            std::cerr << "Error: Directory [" << std::oct << std::setfill('0') 
+                      << std::setw(3) << group << "," << std::setw(3) << member 
+                      << "] not found" << std::dec << std::endl;
+            return false;
+        }
+        
+        // Read UFD and find file
+        auto ufdData = readFile(ufdFileNum);
+        if (ufdData.empty()) {
+            std::cerr << "Error: Cannot read UFD" << std::endl;
+            return false;
+        }
+        
+        uint16_t targetFileNum = 0;
+        int actualVersion = version;
+        
+        // If version is -1, find the latest version
+        if (version == -1) {
+            int maxVer = 0;
+            for (size_t i = 0; i + sizeof(DirEntry) <= ufdData.size(); i += sizeof(DirEntry)) {
+                DirEntry* entry = reinterpret_cast<DirEntry*>(&ufdData[i]);
+                if (entry->file_id[0] == 0) continue;
+                
+                std::string fname = decodeRad50(entry->fname, 3);
+                std::string ftype = decodeRad50(&entry->ftype, 1);
+                
+                if (fname == filename && ftype == type && entry->version > maxVer) {
+                    maxVer = entry->version;
+                    targetFileNum = entry->file_id[0];
+                }
+            }
+            actualVersion = maxVer;
+        } else {
+            // Find specific version
+            for (size_t i = 0; i + sizeof(DirEntry) <= ufdData.size(); i += sizeof(DirEntry)) {
+                DirEntry* entry = reinterpret_cast<DirEntry*>(&ufdData[i]);
+                if (entry->file_id[0] == 0) continue;
+                
+                std::string fname = decodeRad50(entry->fname, 3);
+                std::string ftype = decodeRad50(&entry->ftype, 1);
+                
+                if (fname == filename && ftype == type && entry->version == version) {
+                    targetFileNum = entry->file_id[0];
+                    break;
+                }
+            }
+        }
+        
+        if (targetFileNum == 0) {
+            std::cerr << "Error: File not found: [" << std::oct << std::setfill('0') 
+                      << std::setw(3) << group << "," << std::setw(3) << member 
+                      << "]" << std::dec << filename << "." << type;
+            if (version != -1) std::cerr << ";" << version;
+            std::cerr << std::endl;
+            return false;
+        }
+        
+        // Read file data
+        std::cout << "Reading [" << std::oct << std::setfill('0') 
+                  << std::setw(3) << group << "," << std::setw(3) << member 
+                  << "]" << std::dec << filename << "." << type << ";" << actualVersion << "..." << std::endl;
+        
+        auto fileData = readFile(targetFileNum);
+        if (fileData.empty()) {
+            std::cerr << "Error: Cannot read file data" << std::endl;
+            return false;
+        }
+        
+        // Write to output file
+        std::ofstream out(outputPath, std::ios::binary);
+        if (!out) {
+            std::cerr << "Error: Cannot create output file: " << outputPath << std::endl;
+            return false;
+        }
+        
+        out.write(reinterpret_cast<const char*>(fileData.data()), fileData.size());
+        out.close();
+        
+        std::cout << "Copied to: " << outputPath << " (" << fileData.size() << " bytes)" << std::endl;
+        
+        return true;
+    }
+    
+    // Copy file from Files-11 to host filesystem (legacy extract command)
+    bool extractFile(int group, int member, const std::string& filename, 
+                     const std::string& type, int version, const std::string& outputPath) {
+        return copyFromFiles11(group, member, filename, type, version, outputPath);
+    }
+    
+    void displayHomeBlock();
+    void displayFileHeader(uint16_t fileNum);
+    void displayDirectoryEntry(int group, int member, const std::string& filename, const std::string& type, int version);
+};
+
+// ===== IMPLEMENTATION OF DISPLAY METHODS =====
+
+void Files11FileSystem::displayHomeBlock() {
+    std::cout << "\n=== Volume Information ===" << std::endl;
+    std::cout << std::string(80, '=') << std::endl;
+    
+    // Display volume details
+    std::cout << "\nVolume Name: " << std::string(homeBlock.hm_vnam, 12) << std::endl;
+    std::cout << "Structure Level: " << homeBlock.hm_vlev;
+    if (homeBlock.hm_vlev == 257 || homeBlock.hm_vlev == 0401) {
+        std::cout << " (ODS-1)" << std::endl;
+    } else {
+        std::cout << std::endl;
+    }
+    std::cout << "Max Files: " << homeBlock.hm_fmax << std::endl;
+    std::cout << "Index Bitmap LBN: " << indexBitmapLBN << std::endl;
+    std::cout << "Index Bitmap Size: " << homeBlock.hm_ibsz << " blocks" << std::endl;
+    
+    std::cout << std::string(80, '=') << std::endl;
+}
+
+void Files11FileSystem::displayFileHeader(uint16_t fileNum) {
+    FileHeader header;
+    if (!readFileHeader(fileNum, header)) {
+        std::cerr << "Error: Cannot read file header for file #" << fileNum << std::endl;
+        return;
+    }
+    
+    std::cout << "\n=== File Header for File #" << fileNum << " ===" << std::endl;
+    std::cout << std::string(80, '=') << std::endl;
+    std::cout << "File Number: " << header.h_fnum << std::endl;
+    std::cout << "File Sequence: " << header.h_fseq << std::endl;
+    std::cout << "Structure Level: " << header.h_flev << std::endl;
+    
+    int file_grp = (header.h_fown >> 8) & 0xFF;
+    int file_mem = header.h_fown & 0xFF;
+    std::cout << "Owner UIC: [" << std::oct << std::setfill('0') 
+              << std::setw(3) << file_grp << "," << std::setw(3) << file_mem 
+              << "]" << std::dec << std::endl;
+    
+    uint32_t fileSize = getFileSize(fileNum);
+    std::cout << "File Size: " << fileSize << " blocks (" << (fileSize * BLOCK_SIZE) << " bytes)" << std::endl;
+    
+    std::cout << std::string(80, '=') << std::endl;
+}
+
+void Files11FileSystem::displayDirectoryEntry(int group, int member, const std::string& filename, const std::string& type, int version) {
+    // Find the file
+    FileHeader mfdHeader;
+    if (!readFileHeader(4, mfdHeader)) {
+        std::cerr << "Error: Cannot read MFD" << std::endl;
+        return;
+    }
+    
+    auto mfdData = readFile(4);
+    if (mfdData.empty()) return;
+    
+    // Find UFD
+    char ufdName[16];
+    snprintf(ufdName, sizeof(ufdName), "%03o%03o", group, member);
+    std::string ufdNameStr = ufdName;
+    
+    uint16_t ufdFileNum = 0;
+    for (size_t i = 0; i + sizeof(DirEntry) <= mfdData.size(); i += sizeof(DirEntry)) {
+        DirEntry* entry = reinterpret_cast<DirEntry*>(&mfdData[i]);
+        if (entry->file_id[0] == 0) continue;
+        
+        std::string fname = decodeRad50(entry->fname, 3);
+        std::string ftype = decodeRad50(&entry->ftype, 1);
+        
+        if (fname == ufdNameStr && ftype == "DIR") {
+            ufdFileNum = entry->file_id[0];
+            break;
+        }
+    }
+    
+    if (ufdFileNum == 0) {
+        std::cerr << "Error: Directory not found" << std::endl;
+        return;
+    }
+    
+    // Read UFD and find file
+    auto ufdData = readFile(ufdFileNum);
+    if (ufdData.empty()) return;
+    
+    for (size_t i = 0; i + sizeof(DirEntry) <= ufdData.size(); i += sizeof(DirEntry)) {
+        DirEntry* entry = reinterpret_cast<DirEntry*>(&ufdData[i]);
+        if (entry->file_id[0] == 0) continue;
+        
+        std::string fname = decodeRad50(entry->fname, 3);
+        std::string ftype = decodeRad50(&entry->ftype, 1);
+        
+        if (fname == filename && ftype == type && entry->version == version) {
+            // Found it! Display detailed info
+            std::cout << "\n=== Directory Entry Details ===" << std::endl;
+            std::cout << std::string(80, '=') << std::endl;
+            std::cout << "Filename: " << fname << "." << ftype << ";" << entry->version << std::endl;
+            std::cout << "File Number: " << entry->file_id[0] << std::endl;
+            std::cout << "File Sequence: " << entry->file_id[1] << std::endl;
+            std::cout << "RVN: " << entry->file_id[2] << std::endl;
+            std::cout << std::string(80, '=') << std::endl;
+            
+            // Also display the file header
+            displayFileHeader(entry->file_id[0]);
+            return;
+        }
+    }
+    
+    std::cerr << "Error: File not found: " << filename << "." << type << ";" << version << std::endl;
+}
+
+// ===== HELP FUNCTION =====
+
+// Forward declaration
+void displayHelp();
+
+// Display help information
+void displayHelp() {
+    std::cout << "RSX-11M Files-11 ODS-1 File System Tool - Help\n" << std::endl;
+    std::cout << "This tool provides functions to read and interpret RSX-11M Files-11 ODS-1 disk images," << std::endl;
+    std::cout << "focusing on INDEXF.SYS parsing, file headers, and directory reading." << std::endl;
+    std::cout << "Use this tool to explore and extract files from RSX-11M disk images." << std::endl;
+    
+    std::cout << "\nAvailable commands:" << std::endl;
+    std::cout << "  info                  - Display volume information" << std::endl;
+    std::cout << "  dir <uic>             - List directory (e.g., 1,1 or [1,1])" << std::endl;
+    std::cout << "  file <uic> <filename>   - Show detailed info for one file" << std::endl;
+    std::cout << "  header <filenum>        - Display file header details" << std::endl;
+    std::cout << "  entry <uic> <file>      - Display directory entry & file header" << std::endl;
+    std::cout << "  copyfrom <uic> <file> <dest> - Copy file from Files-11 to Windows" << std::endl;
+    std::cout << "  extract <uic> <file>    - Extract file (legacy command)" << std::endl;
+    std::cout << "  dumpmap <filenum>       - Dump raw map area for debugging" << std::endl;
+    std::cout << "  help                    - Display this help information" << std::endl;
+    
+    std::cout << "\nExamples:" << std::endl;
+    std::cout << "  rsxlst mydisk.hd info                      - Show volume info" << std::endl;
+    std::cout << "  rsxlst mydisk.hd dir 1,2                   - List directory [1,2]" << std::endl;
+    std::cout << "  rsxlst mydisk.hd file 1,2 myfile .txt      - Show info for file [1,2]myfile.txt" << std::endl;
+    std::cout << "  rsxlst mydisk.hd header 4                   - Display header for file #4" << std::endl;
+    std::cout << "  rsxlst mydisk.hd entry 1,2 myfile .txt      - Show directory entry and file header" << std::endl;
+    std::cout << "  rsxlst mydisk.hd copyfrom 1,2 myfile.txt C:\\path\\to\\output.txt - Copy file to Windows" << std::endl;
+    std::cout << "  rsxlst mydisk.hd extract 1,2 myfile .txt    - Extract file (legacy)" << std::endl;
+    std::cout << "  rsxlst mydisk.hd dumpmap 4                  - Dump map area for file #4" << std::endl;
+    
+    std::cout << "\nFor detailed help on specific commands," << std::endl;
+    std::cout << "use the command followed by 'help', e.g., 'dir help'." << std::endl;
+    std::cout << "This will display additional information and options for that command." << std::endl;
+}
+
+// ===== MAIN FUNCTION =====
+
+int main(int argc, char* argv[]) {
+    std::cout << "RSX-11M Files-11 ODS-1 File System Tool v4.0\n" << std::endl;
+    
+    // Check for help request
+    if (argc == 2) {
+        std::string arg = argv[1];
+        std::transform(arg.begin(), arg.end(), arg.begin(), ::tolower);
+        if (arg == "help" || arg == "/help" || arg == "-help" || arg == "--help" || 
+            arg == "/h" || arg == "-h" || arg == "/?" || arg == "-?") {
+            displayHelp();
+            return 0;
+        }
+    }
+    
+    if (argc < 3) {
+        std::cerr << "Usage: rsxlst <disk_image> <command> [options]\n";
+        std::cerr << "       rsxlst help    - Display detailed help\n";
+        std::cerr << "\nCommands:\n";
+        std::cerr << "  info                          - Display volume information\n";
+        std::cerr << "  dir <uic>                     - List directory (e.g., 1,1 or [1,1])\n";
+        std::cerr << "  file <uic> <filename>         - Show detailed info for one file\n";
+        std::cerr << "  header <filenum>              - Display file header details\n";
+        std::cerr << "  entry <uic> <file>            - Display directory entry & file header\n";
+        std::cerr << "  copyfrom <uic> <file> <dest>  - Copy file from Files-11 to Windows\n";
+        std::cerr << "  extract <uic> <file>          - Extract file (legacy command)\n";
+        std::cerr << "  dumpmap <filenum>             - Dump raw map area for debugging\n";
+        std::cerr << "\nFor detailed help: rsxlst help\n";
+        return 1;
+    }
+    
+    std::string imagePath = argv[1];
+    std::string command = argv[2];
+    
+    // Check if command is help
+    std::string cmdLower = command;
+    std::transform(cmdLower.begin(), cmdLower.end(), cmdLower.begin(), ::tolower);
+    if (cmdLower == "help" || cmdLower == "/help" || cmdLower == "-help" || 
+        cmdLower == "/h" || cmdLower == "-h" || cmdLower == "/?" || cmdLower == "-?") {
+        displayHelp();
+        return 0;
+    }
+    
+    Files11FileSystem fs(imagePath);
+    if (!fs.initialize()) {
+        return 1;
+    }
+    
+    // Parse and execute command
+    std::transform(command.begin(), command.end(), command.begin(), ::tolower);
+    if (command == "info") {
+        fs.displayHomeBlock();
+    }
+    else if (command == "dir" && argc == 4) {
+        // Parse UIC from single argument like "1,1" or "[1,1]"
+        std::string uic = argv[3];
+        if (uic[0] == '[') uic = uic.substr(1);
+        if (!uic.empty() && uic[uic.length()-1] == ']') 
+            uic = uic.substr(0, uic.length()-1);
+        
+        size_t comma = uic.find(',');
+        if (comma == std::string::npos) {
+            std::cerr << "Error: Invalid UIC format. Use: 1,1 or [1,1]" << std::endl;
+            return 1;
+        }
+        
+        int group = std::stoi(uic.substr(0, comma));
+        int member = std::stoi(uic.substr(comma + 1));
+        fs.listDirectory(group, member, false);
+    }
+    else if (command == "file" && argc == 5) {
+        // Parse UIC
+        std::string uic = argv[3];
+        if (uic[0] == '[') uic = uic.substr(1);
+        if (!uic.empty() && uic[uic.length()-1] == ']') 
+            uic = uic.substr(0, uic.length()-1);
+        
+        size_t comma = uic.find(',');
+        if (comma == std::string::npos) {
+            std::cerr << "Error: Invalid UIC format" << std::endl;
+            return 1;
+        }
+        
+        int group = std::stoi(uic.substr(0, comma));
+        int member = std::stoi(uic.substr(comma + 1));
+        
+        // Parse filename (NAME.TYPE or NAME.TYPE;version)
+        std::string file = argv[4];
+        std::string name, type;
+        int version = -1;
+        
+        size_t dot = file.find('.');
+        size_t semi = file.find(';');
+        
+        if (dot != std::string::npos) {
+            name = file.substr(0, dot);
+            if (semi != std::string::npos) {
+                type = file.substr(dot + 1, semi - dot - 1);
+                version = std::stoi(file.substr(semi + 1));
+            } else {
+                type = file.substr(dot + 1);
+            }
+        } else {
+            name = file;
+            type = "";
+        }
+        
+        // Convert to uppercase
+        for (auto& c : name) c = toupper(c);
+        for (auto& c : type) c = toupper(c);
+        
+        fs.displayDirectoryEntry(group, member, name, type, version);
+    }
+    else if (command == "header" && argc == 4) {
+        int fileNum = std::stoi(argv[3]);
+        fs.displayFileHeader(fileNum);
+    }
+    else if (command == "entry" && argc == 5) {
+        // Parse UIC
+        std::string uic = argv[3];
+        if (uic[0] == '[') uic = uic.substr(1);
+        if (!uic.empty() && uic[uic.length()-1] == ']') 
+            uic = uic.substr(0, uic.length()-1);
+        
+        size_t comma = uic.find(',');
+        if (comma == std::string::npos) {
+            std::cerr << "Error: Invalid UIC format" << std::endl;
+            return 1;
+        }
+        
+        int group = std::stoi(uic.substr(0, comma));
+        int member = std::stoi(uic.substr(comma + 1));
+        
+        // Parse filename
+        std::string file = argv[4];
+        std::string name, type;
+        int version = -1;
+        
+        size_t dot = file.find('.');
+        size_t semi = file.find(';');
+        
+        if (dot != std::string::npos) {
+            name = file.substr(0, dot);
+            if (semi != std::string::npos) {
+                type = file.substr(dot + 1, semi - dot - 1);
+                version = std::stoi(file.substr(semi + 1));
+            } else {
+                type = file.substr(dot + 1);
+            }
+        } else {
+            name = file;
+            type = "";
+        }
+        
+        // Convert to uppercase
+        for (auto& c : name) c = toupper(c);
+        for (auto& c : type) c = toupper(c);
+        
+        fs.displayDirectoryEntry(group, member, name, type, version);
+    }
+    else if (command == "copyfrom" && argc == 6) {
+        // Parse UIC
+        std::string uic = argv[3];
+        if (uic[0] == '[') uic = uic.substr(1);
+        if (!uic.empty() && uic[uic.length()-1] == ']') 
+            uic = uic.substr(0, uic.length()-1);
+        
+        size_t comma = uic.find(',');
+        if (comma == std::string::npos) {
+            std::cerr << "Error: Invalid UIC format" << std::endl;
+            return 1;
+        }
+        
+        int group = std::stoi(uic.substr(0, comma));
+        int member = std::stoi(uic.substr(comma + 1));
+        
+        // Parse filename
+        std::string file = argv[4];
+        std::string outputPath = argv[5];
+        
+        std::string name, type;
+        int version = -1;
+        
+        size_t dot = file.find('.');
+        size_t semi = file.find(';');
+        
+        if (dot != std::string::npos) {
+            name = file.substr(0, dot);
+            if (semi != std::string::npos) {
+                type = file.substr(dot + 1, semi - dot - 1);
+                version = std::stoi(file.substr(semi + 1));
+            } else {
+                type = file.substr(dot + 1);
+            }
+        } else {
+            name = file;
+            type = "";
+        }
+        
+        // Convert to uppercase
+        for (auto& c : name) c = toupper(c);
+        for (auto& c : type) c = toupper(c);
+        
+        fs.copyFromFiles11(group, member, name, type, version, outputPath);
+    }
+    else if (command == "extract" && argc == 5) {
+        // Parse UIC
+        std::string uic = argv[3];
+        if (uic[0] == '[') uic = uic.substr(1);
+        if (!uic.empty() && uic[uic.length()-1] == ']') 
+            uic = uic.substr(0, uic.length()-1);
+        
+        size_t comma = uic.find(',');
+        if (comma == std::string::npos) {
+            std::cerr << "Error: Invalid UIC format" << std::endl;
+            return 1;
+        }
+        
+        int group = std::stoi(uic.substr(0, comma));
+        int member = std::stoi(uic.substr(comma + 1));
+        
+        // Parse filename
+        std::string file = argv[4];
+        std::string name, type;
+        int version = -1;
+        
+        size_t dot = file.find('.');
+        size_t semi = file.find(';');
+        
+        if (dot != std::string::npos) {
+            name = file.substr(0, dot);
+            if (semi != std::string::npos) {
+                type = file.substr(dot + 1, semi - dot - 1);
+                version = std::stoi(file.substr(semi + 1));
+            } else {
+                type = file.substr(dot + 1);
+            }
+        } else {
+            name = file;
+            type = "";
+        }
+        
+        // Convert to uppercase
+        for (auto& c : name) c = toupper(c);
+        for (auto& c : type) c = toupper(c);
+        
+        std::string outputPath = "extracted_" + name + "." + type;
+        fs.extractFile(group, member, name, type, version, outputPath);
+    }
+    else if (command == "dumpmap" && argc == 4) {
+        int fileNum = std::stoi(argv[3]);
+        
+        FileHeader header;
+        if (!fs.readFileHeader(fileNum, header)) {
+            std::cerr << "Error: Cannot read file header" << std::endl;
+            return 1;
+        }
+        
+        const uint8_t* headerBytes = reinterpret_cast<const uint8_t*>(&header);
+        int mapOffset = header.h_mpof * 2;
+        const uint8_t* mapArea = headerBytes + mapOffset;
+        int mapSize = BLOCK_SIZE - mapOffset;
+        
+        std::cout << "\n=== Map Area Dump for File #" << fileNum << " ===" << std::endl;
+        std::cout << "Map offset: " << mapOffset << " bytes" << std::endl;
+        std::cout << "Map size: " << mapSize << " bytes" << std::endl;
+        
+        std::cout << "\nFirst 64 bytes of map area:" << std::endl;
+        for (int i = 0; i < 64 && i < mapSize; i++) {
+            if (i % 16 == 0) std::cout << std::hex << std::setfill('0') << std::setw(3) << i << ": ";
+            std::cout << std::setfill('0') << std::setw(2) << std::hex << (int)mapArea[i] << " ";
+            if ((i + 1) % 16 == 0) std::cout << std::endl;
+        }
+        std::cout << std::dec << std::endl;
+        
+        std::cout << "\nMap control fields:" << std::endl;
+        std::cout << "M.CTSZ [6] = " << (int)mapArea[6] << " (count field size)" << std::endl;
+        std::cout << "M.LBSZ [7] = " << (int)mapArea[7] << " (LBN field size)" << std::endl;
+        std::cout << "M.USE  [8] = " << (int)mapArea[8] << " (map words in use)" << std::endl;
+        
+        std::cout << "\nRaw pointer bytes at offset 10:" << std::endl;
+        std::cout << "  Bytes: ";
+        for (int i = 10; i < 14 && i < mapSize; i++) {
+            std::cout << std::hex << std::setfill('0') << std::setw(2) << (int)mapArea[i] << " ";
+        }
+        std::cout << std::dec << std::endl;
+        
+        std::cout << "\nUFAT area (bytes 14-45 of header):" << std::endl;
+        for (int i = 0; i < 32; i++) {
+            if (i % 16 == 0) std::cout << "  ";
+            std::cout << std::hex << std::setfill('0') << std::setw(2) << (int)header.h_ufat[i] << " ";
+            if ((i + 1) % 16 == 0) std::cout << std::endl;
+        }
+        std::cout << std::dec << std::endl;
+        
+        uint16_t ufatSize = header.h_ufat[6] | (header.h_ufat[7] << 8);
+        std::cout << "\nFile size from UFAT[6-7]: " << ufatSize << " blocks" << std::endl;
+    }
+    else {
+        std::cerr << "Error: Unknown command or wrong number of arguments: " << command << std::endl;
+        std::cerr << "Type 'rsxlst help' for list of available commands." << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}
