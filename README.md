@@ -1,6 +1,9 @@
 # RSX Files-11 Filesystem Tool (rsxlst)
 
 A command-line utility for reading and writing files to/from RSX-11M+ Files-11 ODS-1 disk images.
+This app was written entirely by CoPilot AI from inside MS Visual Studio 2026 with considerable
+coaching from a human including providing it with technical documents to read.
+No representation as to the quality of the code is made!
 
 ## Overview
 
@@ -10,6 +13,11 @@ A command-line utility for reading and writing files to/from RSX-11M+ Files-11 O
 - Copy files from your host filesystem to RSX-11M+ disks
 - Display file headers and disk volume information
 - Dump file header information for debugging
+
+  BEWARE THAT THIS HAS ONLY BEEN MINIMALLY TESTED.
+  ADDITIONAL TESTING IS UNDERWAY. PLEASE ALWAYS BACKUP
+  YOU DISK IMAGE WHEN USING. DO NOT USE WHILE THE IMAGE
+  IS MOUNTED IN THE RSX-11M+.
 
 This tool supports the Files-11 ODS-1 (On-Disk Structure Level 1) format used by RSX-11M+ operating systems.
 
@@ -26,8 +34,9 @@ This tool supports the Files-11 ODS-1 (On-Disk Structure Level 1) format used by
 
 ### Prerequisites
 
-- C++17 compatible compiler (GCC, Clang, or MSVC)
-- Make (GNU Make or compatible)
+-  If you use Visual Studio, note that VS 2026 was used for the .slnx 
+-  C++17 compatible compiler (GCC, Clang, or MSVC)
+- Make (GNU Make or compatible) -- IMPORTANT - NOT YET TESTED
 
 ### Compilation
 
